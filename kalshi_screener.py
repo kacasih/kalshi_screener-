@@ -81,11 +81,12 @@ MIN_VOL_24H = 1
 EXCLUDE_MVE = True
 QUERY_API_STATUSES = ("open", "paused")
 TARGET_MARKET_STATUSES = {"active", "open", "paused"}
+ENRICH_EVENT_URLS = False
 
 # =============== QUALITY FILTERING - IDENTIFIES ACTUALLY PREDICTABLE BETS ===============
 
-ENABLE_QUALITY_FILTER = True
-MIN_QUALITY_SCORE = 40  # 0-100 scale, bets below this are filtered out
+ENABLE_QUALITY_FILTER = False
+MIN_QUALITY_SCORE = 10  # 0-100 scale, bets below this are filtered out
 
 # Keywords that signal UNPREDICTABLE bets (avoid these)
 AVOID_KEYWORDS = [
@@ -489,8 +490,7 @@ def screen(markets, return_stats: bool = False):
             "days_until_close": days_until,
             "quality_score": quality_score,
             "quality_reasons": "; ".join(quality_reasons) if quality_reasons else "Standard",
-            # Use the full market ticker (not event ticker) and preserve case.
-            "url": f"https://kalshi.com/markets/{market_ticker}" if market_ticker else "",
+            "url": f"https://kalshi.com/markets/{event_ticker.lower()}" if event_ticker else "",
         })
         filter_stats["passed"] += 1
 
@@ -552,6 +552,11 @@ if __name__ == "__main__":
         print(f"  - {k}: {v}")
     print(f"  - passed: {filter_stats['passed']} / {filter_stats['total']}\n")
 
+    if hits:
+        print("Building Kalshi event URLs...")
+        for h in hits:
+            h["url"] = get_event_url(h["event_ticker"])
+
     csv_filename = f"kalshi_quality_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(csv_filename, "w", newline="", encoding="utf-8") as csvfile:
         fieldnames = [
@@ -559,7 +564,7 @@ if __name__ == "__main__":
             "probability", "side", "days_until",
             "liquidity", "open_interest", "volume", "volume_24h", "close_time", "title", "quality_reasons"
         ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
         for h in hits:
