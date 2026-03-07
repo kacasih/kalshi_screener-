@@ -3,6 +3,7 @@ import time
 import csv
 import base64
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -69,7 +70,7 @@ if API_KEY_ID and PRIVATE_KEY_PEM_BYTES:
         PRIVATE_KEY_OBJ = None
 
 # Screening criteria
-MAX_DAYS = 60
+MAX_DAYS = 365
 MIN_DAYS = 0
 PROB_THRESHOLD_CENTS = 80
 # Upper bound is exclusive in filter logic; 98 means include 97c.
@@ -81,11 +82,10 @@ MIN_VOL_24H = 1
 EXCLUDE_MVE = True
 QUERY_API_STATUSES = ("open", "paused")
 TARGET_MARKET_STATUSES = {"active", "open", "paused"}
-ENRICH_EVENT_URLS = False
 
 # =============== QUALITY FILTERING - IDENTIFIES ACTUALLY PREDICTABLE BETS ===============
 
-ENABLE_QUALITY_FILTER = False
+ENABLE_QUALITY_FILTER = True
 MIN_QUALITY_SCORE = 10  # 0-100 scale, bets below this are filtered out
 
 # Keywords that signal UNPREDICTABLE bets (avoid these)
@@ -268,7 +268,7 @@ def fetch_markets(status: str | None = None):
     return out
 
 
-_event_cache = {}
+_series_slug_cache = {}
 
 def slugify(text: str) -> str:
     if not text:
@@ -278,52 +278,71 @@ def slugify(text: str) -> str:
     s = s.replace("'", "")
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-{2,}", "-", s)
-    s = s.strip("-")
-    return s
+    return s.strip("-")
 
-def fetch_event(event_ticker: str) -> dict | None:
-    et = (event_ticker or "").strip()
-    if not et:
+
+def fetch_series(series_ticker: str) -> dict | None:
+    st = (series_ticker or "").strip()
+    if not st:
         return None
 
-    path = f"/trade-api/v2/events/{et}"
+    path = f"/trade-api/v2/series/{st}"
     headers = get_kalshi_headers("GET", path)
 
-    r = requests.get(f"{BASE_URL}/events/{et}", headers=headers, timeout=30)
+    r = requests.get(f"{BASE_URL}/series/{st}", headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return data.get("event")
+    return data.get("series")
 
-def get_event_url(event_ticker: str) -> str:
+
+def get_series_slug(series_ticker: str) -> str:
+    st = (series_ticker or "").strip().upper()
+    if not st:
+        return ""
+    if st in _series_slug_cache:
+        return _series_slug_cache[st]
+
+    fallback = slugify(st)
+
+    try:
+        series = fetch_series(st)
+        series_title = (series or {}).get("title") or st
+        slug = slugify(series_title) or fallback
+    except Exception:
+        slug = fallback
+
+    _series_slug_cache[st] = slug
+    return slug
+
+
+def build_kalshi_event_url(event_ticker: str) -> str:
     et = (event_ticker or "").strip()
     if not et:
         return ""
 
-    et_l = et.lower()
-    if et_l in _event_cache:
-        return _event_cache[et_l]
+    series_ticker = et.split("-", 1)[0].strip()
+    if not series_ticker:
+        return f"https://kalshi.com/markets/{et.lower()}"
 
-    fallback = f"https://kalshi.com/markets/{et_l}"
+    series_slug = get_series_slug(series_ticker)
+    return f"https://kalshi.com/markets/{series_ticker.lower()}/{series_slug}/{et.lower()}"
 
-    try:
-        ev = fetch_event(et)
-        if not ev:
-            _event_cache[et_l] = fallback
-            return fallback
 
-        series = (ev.get("series_ticker") or "").strip() or et.split("-", 1)[0]
-        series_l = series.lower()
+def prefetch_series_slugs(event_tickers, max_workers: int = 16):
+    series_tickers = {
+        (et or "").split("-", 1)[0].strip().upper()
+        for et in event_tickers
+        if et and "-" in et
+    }
+    missing = [st for st in series_tickers if st and st not in _series_slug_cache]
+    if not missing:
+        return
 
-        slug_source = (ev.get("sub_title") or ev.get("title") or series).strip()
-        slug = slugify(slug_source) or series_l
-
-        url = f"https://kalshi.com/markets/{series_l}/{slug}/{et_l}"
-        _event_cache[et_l] = url
-        return url
-
-    except Exception:
-        _event_cache[et_l] = fallback
-        return fallback
+    workers = min(max_workers, len(missing))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(get_series_slug, st): st for st in missing}
+        for future in as_completed(futures):
+            future.result()
 
 
 def screen(markets, return_stats: bool = False):
@@ -490,7 +509,7 @@ def screen(markets, return_stats: bool = False):
             "days_until_close": days_until,
             "quality_score": quality_score,
             "quality_reasons": "; ".join(quality_reasons) if quality_reasons else "Standard",
-            "url": f"https://kalshi.com/markets/{event_ticker.lower()}" if event_ticker else "",
+            "url": "",
         })
         filter_stats["passed"] += 1
 
@@ -553,9 +572,15 @@ if __name__ == "__main__":
     print(f"  - passed: {filter_stats['passed']} / {filter_stats['total']}\n")
 
     if hits:
-        print("Building Kalshi event URLs...")
+        unique_series = {
+            h["event_ticker"].split("-", 1)[0].strip().upper()
+            for h in hits
+            if h.get("event_ticker") and "-" in h["event_ticker"]
+        }
+        print(f"Building Kalshi links from {len(unique_series)} series definitions...")
+        prefetch_series_slugs([h["event_ticker"] for h in hits])
         for h in hits:
-            h["url"] = get_event_url(h["event_ticker"])
+            h["url"] = build_kalshi_event_url(h["event_ticker"])
 
     csv_filename = f"kalshi_quality_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     with open(csv_filename, "w", newline="", encoding="utf-8") as csvfile:
@@ -564,7 +589,7 @@ if __name__ == "__main__":
             "probability", "side", "days_until",
             "liquidity", "open_interest", "volume", "volume_24h", "close_time", "title", "quality_reasons"
         ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
 
         for h in hits:
